@@ -27,7 +27,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
 COPY uv.lock pyproject.toml /app/
 
 # Sync the project
-RUN --mount=type=cache,target=/root/.cache/uv \
+RUN --mount=type=cache,id=uv-cache,target=/root/.cache/uv \
     uv sync --frozen --no-group dev
 
 # Place executables in the environment at the front of the path
