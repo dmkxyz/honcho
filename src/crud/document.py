@@ -15,14 +15,18 @@ from src.config import settings
 from src.crud.collection import get_or_create_collection
 from src.crud.peer import get_peer
 from src.crud.session import get_session
+from src.dependencies import tracked_db
 from src.embedding_client import embedding_client
-from src.exceptions import ResourceNotFoundException, ValidationException
+from src.exceptions import (
+    ResourceNotFoundException,
+    ValidationException,
+    VectorStoreError,
+)
 from src.utils.filter import apply_filter
 from src.vector_store import (
     VectorRecord,
     VectorStore,
     get_external_vector_store,
-    upsert_with_retry,
 )
 
 logger = getLogger(__name__)
@@ -172,7 +176,8 @@ async def query_documents_most_derived(
         limit: Maximum number of documents to return
 
     Returns:
-        Sequence of documents ordered by times_derived descending
+        Sequence of documents ordered by times_derived descending,
+        ties broken by created_at descending (most recent first)
     """
     stmt = (
         select(models.Document)
@@ -182,7 +187,13 @@ async def query_documents_most_derived(
             models.Document.observed == observed,
             models.Document.deleted_at.is_(None),
         )
-        .order_by(models.Document.times_derived.desc())
+        .order_by(
+            models.Document.times_derived.desc(),
+            models.Document.created_at.desc(),
+            # created_at is the transaction timestamp, so documents created in
+            # the same batch share it -- id keeps the order deterministic.
+            models.Document.id,
+        )
         .limit(limit)
     )
 
@@ -190,8 +201,127 @@ async def query_documents_most_derived(
     return result.scalars().all()
 
 
-async def query_documents(
+def _uses_pgvector() -> bool:
+    """Check whether queries should go through pgvector (DB-only) path."""
+    return (
+        settings.VECTOR_STORE.TYPE == "pgvector" or not settings.VECTOR_STORE.MIGRATED
+    )
+
+
+async def query_external_vector_document_ids(
+    workspace_name: str,
+    observer: str,
+    observed: str,
+    embedding: list[float],
+    top_k: int = 5,
+    max_distance: float | None = None,
+    filters: dict[str, Any] | None = None,
+) -> list[str] | None:
+    """Query external vector store for document IDs sorted by similarity.
+
+    No DB session needed — safe to call outside a tracked_db scope.
+
+    Returns:
+        Ordered list of document IDs on the external-store path,
+        empty list when the external store has no results,
+        or None when the pgvector (DB-only) path should be used instead.
+    """
+    if _uses_pgvector():
+        return None
+
+    external_vector_store = get_external_vector_store()
+    if external_vector_store is None:
+        return []
+
+    namespace = external_vector_store.get_vector_namespace(
+        "document", workspace_name, observer, observed
+    )
+
+    vector_filters: dict[str, Any] = {}
+    if filters:
+        for key in ["level", "session_name"]:
+            if key in filters:
+                vector_filters[key] = filters[key]
+
+    vector_results = await external_vector_store.query(
+        namespace,
+        embedding,
+        top_k=top_k,
+        max_distance=max_distance,
+        filters=vector_filters if vector_filters else None,
+        include_attributes=False,
+    )
+
+    if not vector_results:
+        return []
+
+    return [result.id for result in vector_results]
+
+
+async def fetch_documents_by_ids(
     db: AsyncSession,
+    workspace_name: str,
+    observer: str,
+    observed: str,
+    document_ids: list[str],
+    filters: dict[str, Any] | None = None,
+) -> list[models.Document]:
+    """Fetch documents by IDs, preserving input order. DB-only operation."""
+    if not document_ids:
+        return []
+
+    stmt = (
+        select(models.Document)
+        .where(models.Document.workspace_name == workspace_name)
+        .where(models.Document.observer == observer)
+        .where(models.Document.observed == observed)
+        .where(models.Document.deleted_at.is_(None))
+        .where(models.Document.id.in_(document_ids))
+    )
+    stmt = apply_filter(stmt, models.Document, filters)
+
+    result = await db.execute(stmt)
+    documents = {doc.id: doc for doc in result.scalars().all()}
+
+    return [documents[doc_id] for doc_id in document_ids if doc_id in documents]
+
+
+async def _query_documents_pgvector(
+    db: AsyncSession,
+    workspace_name: str,
+    observer: str,
+    observed: str,
+    embedding: list[float],
+    filters: dict[str, Any] | None,
+    max_distance: float | None,
+    top_k: int,
+) -> list[models.Document]:
+    """pgvector similarity search — pure DB operation."""
+    stmt = (
+        select(models.Document)
+        .where(models.Document.workspace_name == workspace_name)
+        .where(models.Document.observer == observer)
+        .where(models.Document.observed == observed)
+        .where(models.Document.embedding.isnot(None))
+        .where(models.Document.deleted_at.is_(None))
+    )
+
+    if max_distance is not None:
+        stmt = stmt.where(
+            models.Document.embedding.cosine_distance(embedding) <= max_distance
+        )
+
+    stmt = apply_filter(stmt, models.Document, filters)
+    stmt = stmt.order_by(models.Document.embedding.cosine_distance(embedding)).limit(
+        top_k
+    )
+
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
+
+
+async def query_documents(
+    db: AsyncSession | None,
     workspace_name: str,
     query: str,
     *,
@@ -205,8 +335,12 @@ async def query_documents(
     """
     Query documents using semantic similarity.
 
+    When *db* is provided the caller owns the session lifetime.  When *db* is
+    ``None`` the function opens (and closes) its own short-lived session so that
+    no DB connection is held during external vector-store calls.
+
     Args:
-        db: Database session
+        db: Database session, or None to let the function manage its own
         workspace_name: Name of the workspace
         query: Search query text
         observer: Name of the observing peer
@@ -225,92 +359,73 @@ async def query_documents(
             embedding = await embedding_client.embed(query)
         except ValueError as e:
             raise ValidationException(
-                f"Query exceeds maximum token limit of {settings.MAX_EMBEDDING_TOKENS}."
+                "Query exceeds maximum token limit of "
+                + f"{settings.EMBEDDING.MAX_INPUT_TOKENS}."
             ) from e
 
-    # Query Postgres directly when using pgvector OR during migration (not yet migrated)
-    # This ensures we use pgvector as source of truth until migration is complete
-    if settings.VECTOR_STORE.TYPE == "pgvector" or not settings.VECTOR_STORE.MIGRATED:
-        stmt = (
-            select(models.Document)
-            .where(models.Document.workspace_name == workspace_name)
-            .where(models.Document.observer == observer)
-            .where(models.Document.observed == observed)
-            .where(models.Document.embedding.isnot(None))
-            .where(models.Document.deleted_at.is_(None))
-        )
-
-        if max_distance is not None:
-            stmt = stmt.where(
-                models.Document.embedding.cosine_distance(embedding) <= max_distance
+    if _uses_pgvector():
+        # pgvector path — pure DB, open a short session if none provided
+        if db is not None:
+            return await _query_documents_pgvector(
+                db,
+                workspace_name,
+                observer,
+                observed,
+                embedding,
+                filters,
+                max_distance,
+                top_k,
             )
+        async with tracked_db("query_documents.pgvector", read_only=True) as managed_db:
+            docs = await _query_documents_pgvector(
+                managed_db,
+                workspace_name,
+                observer,
+                observed,
+                embedding,
+                filters,
+                max_distance,
+                top_k,
+            )
+            for doc in docs:
+                managed_db.expunge(doc)
+            return docs
 
-        stmt = apply_filter(stmt, models.Document, filters)
-        stmt = stmt.order_by(
-            models.Document.embedding.cosine_distance(embedding)
-        ).limit(top_k)
-
-        result = await db.execute(stmt)
-        return list(result.scalars().all())
-
-    # FALLBACK: Use external vector store (Turbopuffer, LanceDB)
-    external_vector_store = get_external_vector_store()
-    if external_vector_store is None:
-        return []
-
-    namespace = external_vector_store.get_vector_namespace(
-        "document", workspace_name, observer, observed
-    )
-
-    # Build vector store filters
-    # Convert filter dict to vector store format (handles level, session_name, etc.)
-    vector_filters: dict[str, Any] = {}
-    if filters:
-        # Direct pass-through for simple equality filters
-        # The filters dict can contain: level, session_name, or other document fields
-        # We can push level and session_name to vector store since they're in metadata
-        for key in ["level", "session_name"]:
-            if key in filters:
-                vector_filters[key] = filters[key]
-
-    # Query external vector store for similar documents with filters applied
-    vector_results = await external_vector_store.query(
-        namespace,
-        embedding,
+    # External vector store — network call first, DB only for the ID fetch
+    document_ids = await query_external_vector_document_ids(
+        workspace_name=workspace_name,
+        observer=observer,
+        observed=observed,
+        embedding=embedding,
         top_k=top_k,
         max_distance=max_distance,
-        filters=vector_filters if vector_filters else None,
+        filters=filters,
     )
 
-    if not vector_results:
+    if not document_ids:
         return []
 
-    # Get document IDs from vector results (vector ID = document ID for documents)
-    document_ids = [result.id for result in vector_results]
-
-    # Fetch documents from database
-    stmt = (
-        select(models.Document)
-        .where(models.Document.workspace_name == workspace_name)
-        .where(models.Document.observer == observer)
-        .where(models.Document.observed == observed)
-        .where(models.Document.deleted_at.is_(None))
-        .where(models.Document.id.in_(document_ids))
-    )
-    # Re-apply all filters at the database layer to catch any constraints
-    # that aren't supported by the vector store metadata.
-    stmt = apply_filter(stmt, models.Document, filters)
-
-    result = await db.execute(stmt)
-    documents = {doc.id: doc for doc in result.scalars().all()}
-
-    # Return documents in order of similarity (preserving vector store order)
-    ordered_docs: list[models.Document] = []
-    for vr in vector_results:
-        if vr.id in documents:
-            ordered_docs.append(documents[vr.id])
-
-    return ordered_docs
+    if db is not None:
+        return await fetch_documents_by_ids(
+            db=db,
+            workspace_name=workspace_name,
+            observer=observer,
+            observed=observed,
+            document_ids=document_ids,
+            filters=filters,
+        )
+    async with tracked_db("query_documents.fetch", read_only=True) as managed_db:
+        docs = await fetch_documents_by_ids(
+            db=managed_db,
+            workspace_name=workspace_name,
+            observer=observer,
+            observed=observed,
+            document_ids=document_ids,
+            filters=filters,
+        )
+        for doc in docs:
+            managed_db.expunge(doc)
+        return docs
 
 
 async def create_documents(
@@ -321,7 +436,7 @@ async def create_documents(
     observer: str,
     observed: str,
     deduplicate: bool = False,
-) -> int:
+) -> list[schemas.DocumentCreate]:
     """
     Create multiple documents with optional duplicate detection.
 
@@ -333,9 +448,11 @@ async def create_documents(
         observed: Name of the observed peer
 
     Returns:
-        Count of new documents
+        List of DocumentCreate schemas that were actually inserted (excludes
+        duplicates and failures).
     """
     honcho_documents: list[models.Document] = []
+    accepted_documents: list[schemas.DocumentCreate] = []
     # Store (document_model, embedding) pairs - IDs aren't available until after commit
     docs_with_embeddings: list[tuple[models.Document, list[float]]] = []
 
@@ -391,6 +508,7 @@ async def create_documents(
             if doc.embedding:
                 new_doc.sync_state = "pending"
             honcho_documents.append(new_doc)
+            accepted_documents.append(doc)
 
             # Track embedding for vector store (ID will be available after commit)
             if doc.embedding:
@@ -453,11 +571,9 @@ async def create_documents(
                         )
                     )
 
-                # Upsert to external vector store with retry and update sync state
+                # Upsert to external vector store and update sync state
                 try:
-                    await upsert_with_retry(
-                        external_vector_store, namespace, vector_records
-                    )
+                    await external_vector_store.upsert_many(namespace, vector_records)
                     # Success: mark as synced
                     await db.execute(
                         update(models.Document)
@@ -470,9 +586,21 @@ async def create_documents(
                     )
                     await db.commit()
 
+                except VectorStoreError:
+                    # Vector store unavailable - increment sync_attempts for reconciliation
+                    logger.warning("Vector store unavailable; leaving docs unsynced")
+                    await db.execute(
+                        update(models.Document)
+                        .where(models.Document.id.in_(doc_ids))
+                        .values(
+                            sync_attempts=models.Document.sync_attempts + 1,
+                            last_sync_at=func.now(),
+                        )
+                    )
+                    await db.commit()
+
                 except Exception:
-                    # Failed after retries - increment sync_attempts for reconciliation
-                    logger.exception("Failed to upsert vectors after retries")
+                    logger.exception("Unexpected error upserting vectors")
                     await db.execute(
                         update(models.Document)
                         .where(models.Document.id.in_(doc_ids))
@@ -489,7 +617,7 @@ async def create_documents(
             "Failed to create documents due to integrity constraint violation"
         ) from e
 
-    return len(honcho_documents)
+    return accepted_documents
 
 
 async def delete_document(
@@ -539,6 +667,48 @@ async def delete_document(
         )
 
     await db.commit()
+
+
+async def delete_documents(
+    db: AsyncSession,
+    workspace_name: str,
+    document_ids: Sequence[str],
+    *,
+    observer: str,
+    observed: str,
+    session_name: str | None = None,
+) -> list[tuple[str, str]]:
+    """
+    Soft-delete multiple documents in a single UPDATE ... RETURNING statement.
+
+    Returns (id, level) tuples for rows that actually got deleted — i.e. rows
+    that matched the workspace/observer/observed filter and were not already
+    soft-deleted. IDs that didn't match are silently skipped; callers can diff
+    the returned ids against the input to detect misses.
+    """
+    if not document_ids:
+        return []
+
+    conditions = [
+        models.Document.id.in_(document_ids),
+        models.Document.workspace_name == workspace_name,
+        models.Document.observer == observer,
+        models.Document.observed == observed,
+        models.Document.deleted_at.is_(None),
+    ]
+    if session_name is not None:
+        conditions.append(models.Document.session_name == session_name)
+
+    stmt = (
+        update(models.Document)
+        .where(*conditions)
+        .values(deleted_at=func.now())
+        .returning(models.Document.id, models.Document.level)
+    )
+    result = await db.execute(stmt)
+    rows = result.all()
+    await db.commit()
+    return [(row.id, row.level) for row in rows]
 
 
 async def delete_document_by_id(
@@ -739,11 +909,9 @@ async def create_observations(
                         )
                     )
 
-                # Upsert to external vector store with retry and update sync state
+                # Upsert to external vector store and update sync state
                 try:
-                    await upsert_with_retry(
-                        external_vector_store, namespace, vector_records
-                    )
+                    await external_vector_store.upsert_many(namespace, vector_records)
                     # Success: mark as synced
                     await db.execute(
                         update(models.Document)
@@ -756,10 +924,24 @@ async def create_observations(
                     )
                     await db.commit()
 
+                except VectorStoreError:
+                    logger.warning(
+                        "Vector store unavailable for namespace %s; leaving observations unsynced",
+                        namespace,
+                    )
+                    await db.execute(
+                        update(models.Document)
+                        .where(models.Document.id.in_(doc_ids))
+                        .values(
+                            sync_attempts=models.Document.sync_attempts + 1,
+                            last_sync_at=func.now(),
+                        )
+                    )
+                    await db.commit()
+
                 except Exception:
-                    # Failed after retries - increment sync_attempts for reconciliation
                     logger.exception(
-                        f"Failed to upsert vectors for {namespace} after retries"
+                        "Unexpected error upserting vectors for %s", namespace
                     )
                     await db.execute(
                         update(models.Document)
@@ -805,7 +987,13 @@ async def is_rejected_duplicate(
     If the document is not a duplicate, returns False.
 
     If the document is a duplicate AND the new document is superior,
-    deletes the existing document and returns False.
+    deletes the existing document and returns False. In this case
+    ``doc.times_derived`` is updated in place to carry the replaced
+    document's reinforcement count forward.
+
+    If the document is a duplicate AND the existing document is superior,
+    increments the existing document's ``times_derived`` to record the
+    reinforcement, then returns True.
     """
     # Step 1: Find potential duplicates using cosine similarity
     similar_docs = await query_documents(
@@ -836,17 +1024,29 @@ async def is_rejected_duplicate(
 
     # If new document has more or equal information, keep it and delete existing
     if score_new >= score_existing:
-        logger.warning(
-            f"[DUPLICATE DETECTION] Deleting existing in favor of new. new='{doc.content}', existing='{existing_doc.content}'."
+        logger.debug(
+            "[DUPLICATE DETECTION] Deleting existing in favor of new. new=%r, existing=%r.",
+            doc.content,
+            existing_doc.content,
         )
+        # Carry the reinforcement count forward so replacing a duplicate counts as
+        # another derivation rather than resetting times_derived to 1.
+        doc.times_derived = max(doc.times_derived, existing_doc.times_derived + 1)
         # Soft-delete the existing document - reconciliation will clean up vectors and hard-delete
         existing_doc.deleted_at = datetime.datetime.now(datetime.timezone.utc)
         await db.flush()
         return False  # Don't reject the new document
 
-    # Existing document has more information, reject the new one
-    logger.warning(
-        f"[DUPLICATE DETECTION] Rejecting new in favor of existing. new='{doc.content}', existing='{existing_doc.content}'."
+    # Existing document has more information, reject the new one but record the
+    # reinforcement: a semantic duplicate was derived again. Assign a SQL
+    # expression so the increment is atomic server-side -- concurrent workers
+    # reinforcing the same document must not lose updates.
+    existing_doc.times_derived = models.Document.times_derived + 1
+    await db.flush()
+    logger.debug(
+        "[DUPLICATE DETECTION] Rejecting new in favor of existing. new=%r, existing=%r.",
+        doc.content,
+        existing_doc.content,
     )
     return True
 

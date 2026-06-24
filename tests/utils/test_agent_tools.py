@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from nanoid import generate as generate_nanoid
@@ -13,7 +14,9 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from src import crud, models, schemas
 from src.config import settings
 from src.utils.agent_tools import (
+    MAX_PEER_CARD_ENTRY_LENGTH,
     MAX_PEER_CARD_FACTS,
+    PEER_CARD_ALLOWED_PREFIXES,
     ObservationsCreatedResult,
     ToolContext,
     _handle_create_observations,  # pyright: ignore[reportPrivateUsage]
@@ -29,7 +32,10 @@ from src.utils.agent_tools import (
     _handle_grep_messages,  # pyright: ignore[reportPrivateUsage]
     _handle_search_memory,  # pyright: ignore[reportPrivateUsage]
     _handle_search_messages,  # pyright: ignore[reportPrivateUsage]
+    _handle_search_messages_temporal,  # pyright: ignore[reportPrivateUsage]
     _handle_update_peer_card,  # pyright: ignore[reportPrivateUsage]
+    _normalize_observation_id,  # pyright: ignore[reportPrivateUsage]
+    _validate_peer_card_entry,  # pyright: ignore[reportPrivateUsage]
     create_observations,
     create_tool_executor,
     extract_preferences,
@@ -118,15 +124,17 @@ async def tool_test_data(
     for doc in documents:
         await db_session.refresh(doc)
 
-    yield workspace, peer1, peer2, session, messages, documents
+    # Commit so data is visible to independent tracked_db sessions.
+    # Tool handlers no longer share the test's db_session — they open
+    # their own short-lived sessions via tracked_db.
+    # _truncate_all_tables handles cleanup between tests.
+    await db_session.commit()
 
-    await db_session.rollback()
+    yield workspace, peer1, peer2, session, messages, documents
 
 
 @pytest.fixture
-def make_tool_context(
-    db_session: AsyncSession, tool_test_data: Any
-) -> Callable[..., ToolContext]:
+def make_tool_context(tool_test_data: Any) -> Callable[..., ToolContext]:
     """Factory fixture to create ToolContext with custom parameters."""
     workspace, peer1, peer2, session, _messages, _ = tool_test_data
     shared_lock = asyncio.Lock()
@@ -137,9 +145,11 @@ def make_tool_context(
         include_observation_ids: bool = False,
         history_token_limit: int = 8192,
         session_name: str | None = None,
+        run_id: str | None = None,
+        agent_type: str | None = None,
+        parent_category: str | None = None,
     ) -> ToolContext:
         return ToolContext(
-            db=db_session,
             workspace_name=workspace.name,
             observer=peer1.name,
             observed=peer2.name,
@@ -148,6 +158,9 @@ def make_tool_context(
             include_observation_ids=include_observation_ids,
             history_token_limit=history_token_limit,
             db_lock=shared_lock,
+            run_id=run_id,
+            agent_type=agent_type,
+            parent_category=parent_category,
         )
 
     return _make_context
@@ -235,6 +248,40 @@ class TestCreateObservations:
         assert doc.level == "deductive"
         assert doc.source_ids == ["premise1", "premise2"]
 
+    async def test_source_ids_display_prefix_is_stripped(
+        self,
+        db_session: AsyncSession,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """Models sometimes copy the '[id:xxx]' display format into source_ids;
+        the prefix must be stripped so provenance links reference real IDs."""
+        ctx = make_tool_context(current_messages=None)
+
+        result = await _handle_create_observations(
+            ctx,
+            {
+                "observations": [
+                    {
+                        "content": "Inferred preference for early mornings",
+                        "source_ids": ["id:premise1", "ID:premise2"],
+                        "premises": [
+                            "User schedules meetings before 9am",
+                            "User mentions waking at 5:30",
+                        ],
+                    },
+                ]
+            },
+        )
+
+        assert "Created 1 observations" in result
+
+        stmt = select(models.Document).where(
+            models.Document.content == "Inferred preference for early mornings"
+        )
+        doc = (await db_session.execute(stmt)).scalar_one_or_none()
+        assert doc is not None
+        assert doc.source_ids == ["premise1", "premise2"]
+
     async def test_empty_observations_list_returns_error(
         self, make_tool_context: Callable[..., ToolContext]
     ):
@@ -244,11 +291,11 @@ class TestCreateObservations:
         result = await _handle_create_observations(ctx, {"observations": []})
 
         assert "ERROR" in result
-        assert "empty" in result.lower()
+        # Handlers may return ToolResult (); str() returns .content.
+        assert "empty" in str(result).lower()
 
     async def test_batch_embedding_failure_falls_back_to_individual_embeds(
         self,
-        db_session: AsyncSession,
         tool_test_data: Any,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -271,10 +318,10 @@ class TestCreateObservations:
             observer: str,
             observed: str,
             deduplicate: bool = False,
-        ) -> int:
+        ) -> list[Any]:
             _ = (workspace_name, observer, observed, deduplicate)
             created_documents.extend(documents)
-            return len(documents)
+            return documents
 
         monkeypatch.setattr(
             "src.utils.agent_tools.embedding_client.simple_batch_embed",
@@ -289,7 +336,6 @@ class TestCreateObservations:
         )
 
         result = await create_observations(
-            db_session,
             observations=[
                 schemas.ObservationInput(content="First obs", level="explicit"),
                 schemas.ObservationInput(content="Second obs", level="explicit"),
@@ -309,7 +355,6 @@ class TestCreateObservations:
 
     async def test_batch_embedding_failure_individual_embed_partial_failure(
         self,
-        db_session: AsyncSession,
         tool_test_data: Any,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -334,10 +379,10 @@ class TestCreateObservations:
             observer: str,
             observed: str,
             deduplicate: bool = False,
-        ) -> int:
+        ) -> list[Any]:
             _ = (workspace_name, observer, observed, deduplicate)
             created_documents.extend(documents)
-            return len(documents)
+            return documents
 
         monkeypatch.setattr(
             "src.utils.agent_tools.embedding_client.simple_batch_embed",
@@ -352,7 +397,6 @@ class TestCreateObservations:
         )
 
         result = await create_observations(
-            db_session,
             observations=[
                 schemas.ObservationInput(content="Embeds fine", level="explicit"),
                 schemas.ObservationInput(content="Fails embed", level="explicit"),
@@ -372,6 +416,119 @@ class TestCreateObservations:
         assert "Embedding failed" in result.failed[0].error
         assert len(created_documents) == 1
         assert created_documents[0].content == "Embeds fine"
+
+    async def test_create_observations_filters_blank_content_before_embedding(
+        self,
+        tool_test_data: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Blank or whitespace-only observations are dropped before embedding/persistence."""
+        workspace, peer1, peer2, session, _, _ = tool_test_data
+        created_documents: list[Any] = []
+
+        async def fake_batch_embed(texts: list[str]) -> list[list[float]]:
+            assert texts == ["trimmed observation"]
+            return [[0.4, 0.5, 0.6]]
+
+        async def fake_create_documents(
+            _db: AsyncSession,
+            documents: list[Any],
+            workspace_name: str,
+            *,
+            observer: str,
+            observed: str,
+            deduplicate: bool = False,
+        ) -> list[Any]:
+            _ = (workspace_name, observer, observed, deduplicate)
+            created_documents.extend(documents)
+            return documents
+
+        monkeypatch.setattr(
+            "src.utils.agent_tools.embedding_client.simple_batch_embed",
+            fake_batch_embed,
+        )
+        monkeypatch.setattr(
+            "src.utils.agent_tools.crud.create_documents", fake_create_documents
+        )
+
+        result = await create_observations(
+            observations=[
+                schemas.ObservationInput(content="   ", level="explicit"),
+                schemas.ObservationInput(
+                    content=" trimmed observation ", level="explicit"
+                ),
+            ],
+            observer=peer1.name,
+            observed=peer2.name,
+            session_name=session.name,
+            workspace_name=workspace.name,
+            message_ids=[],
+            message_created_at=str(datetime.now(timezone.utc)),
+        )
+
+        assert isinstance(result, ObservationsCreatedResult)
+        assert result.created_count == 1
+        assert len(result.failed) == 0
+        assert len(created_documents) == 1
+        assert created_documents[0].content == "trimmed observation"
+
+    async def test_create_observations_skips_all_blank_content(
+        self,
+        tool_test_data: Any,
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """All-blank observations short-circuit without embedding or persistence."""
+        workspace, peer1, peer2, session, _, _ = tool_test_data
+        batch_embed = AsyncMock()
+        create_documents = AsyncMock()
+
+        monkeypatch.setattr(
+            "src.utils.agent_tools.embedding_client.simple_batch_embed",
+            batch_embed,
+        )
+        monkeypatch.setattr(
+            "src.utils.agent_tools.crud.create_documents", create_documents
+        )
+
+        result = await create_observations(
+            observations=[
+                schemas.ObservationInput(content=" ", level="explicit"),
+                schemas.ObservationInput(content="\n\t", level="explicit"),
+            ],
+            observer=peer1.name,
+            observed=peer2.name,
+            session_name=session.name,
+            workspace_name=workspace.name,
+            message_ids=[],
+            message_created_at=str(datetime.now(timezone.utc)),
+        )
+
+        assert isinstance(result, ObservationsCreatedResult)
+        assert result.created_count == 0
+        assert len(result.failed) == 0
+        batch_embed.assert_not_awaited()
+        create_documents.assert_not_awaited()
+
+
+class TestNormalizeObservationId:
+    """Unit tests for _normalize_observation_id."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            ("doc_abc123", "doc_abc123"),
+            ("id:doc_abc123", "doc_abc123"),
+            ("ID:doc_abc123", "doc_abc123"),
+            ("  id:doc_abc123  ", "doc_abc123"),
+            ("id: doc_abc123", "doc_abc123"),
+            # nanoid alphabet includes '-' and '_'; these must survive untouched
+            ("3-bwp1hxCRkRbUh_nrqn0", "3-bwp1hxCRkRbUh_nrqn0"),
+            ("id:3-bwp1hxCRkRbUh_nrqn0", "3-bwp1hxCRkRbUh_nrqn0"),
+            ("_leading_underscore", "_leading_underscore"),
+        ],
+    )
+    def test_normalization(self, raw: str, expected: str):
+        assert _normalize_observation_id(raw) == expected
 
 
 @pytest.mark.asyncio
@@ -393,6 +550,8 @@ class TestDeleteObservations:
 
         assert "Deleted 1 observations" in result
 
+        # Expire the document so the identity map picks up the committed soft-delete
+        db_session.expire(documents[0])
         # Verify soft-deletion (document still exists but has deleted_at timestamp)
         stmt = select(models.Document).where(models.Document.id == doc_id)
         doc = (await db_session.execute(stmt)).scalar_one_or_none()
@@ -411,6 +570,82 @@ class TestDeleteObservations:
 
         # Should report 0 deleted (graceful handling)
         assert "Deleted 0 observations" in result
+
+    async def test_delete_batch_emits_levels_for_successful_only(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Batch delete with mixed levels emits levels only for rows actually deleted."""
+        workspace, peer1, peer2, session, _messages, documents = tool_test_data
+
+        # Add two extra documents with non-explicit levels so the batch spans levels.
+        deductive_doc = models.Document(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+            content="Works in tech",
+            embedding=[0.42] * 1536,
+            session_name=session.name,
+            level="deductive",
+            metadata={},
+        )
+        inductive_doc = models.Document(
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+            content="Tends to be an early riser",
+            embedding=[0.43] * 1536,
+            session_name=session.name,
+            level="inductive",
+            metadata={},
+        )
+        db_session.add_all([deductive_doc, inductive_doc])
+        await db_session.flush()
+        await db_session.refresh(deductive_doc)
+        await db_session.refresh(inductive_doc)
+        await db_session.commit()
+
+        # Capture emitted telemetry events.
+        from src.telemetry.events import AgentToolConclusionsDeletedEvent
+        from src.telemetry.events.base import BaseEvent
+        from src.utils import agent_tools as agent_tools_module
+
+        captured: list[BaseEvent] = []
+
+        def _capture(event: BaseEvent) -> None:
+            captured.append(event)
+
+        monkeypatch.setattr(agent_tools_module, "emit", _capture)
+
+        ctx = make_tool_context(
+            include_observation_ids=True,
+            run_id="test_run",
+            agent_type="deduction",
+            parent_category="dream",
+        )
+
+        explicit_doc_id = documents[0].id
+        ids_to_delete = [
+            explicit_doc_id,
+            deductive_doc.id,
+            inductive_doc.id,
+            "nonexistent_id_12345",
+        ]
+
+        result = await _handle_delete_observations(
+            ctx, {"observation_ids": ids_to_delete}
+        )
+
+        assert "Deleted 3 observations" in result
+        assert len(captured) == 1
+        event = captured[0]
+        assert isinstance(event, AgentToolConclusionsDeletedEvent)
+        assert event.conclusion_count == 3
+        # RETURNING order is not guaranteed; compare as multiset.
+        assert sorted(event.levels) == sorted(["explicit", "deductive", "inductive"])
 
 
 @pytest.mark.asyncio
@@ -482,7 +717,6 @@ class TestSearchMemory:
         await db_session.flush()
 
         ctx = ToolContext(
-            db=db_session,
             workspace_name=workspace.name,
             observer=peer1.name,
             observed=peer2.name,
@@ -530,15 +764,15 @@ class TestSearchMemory:
             return []
 
         async def fake_search_messages(
-            db: AsyncSession,
             workspace_name: str,
             session_name: str | None,
             query: str,
             limit: int = 10,
             context_window: int = 2,
             embedding: list[float] | None = None,
+            observer: str | None = None,
         ) -> list[tuple[list[models.Message], list[models.Message]]]:
-            _ = (db, workspace_name, session_name, query, limit, context_window)
+            _ = (workspace_name, session_name, query, limit, context_window, observer)
             fallback_embeddings.append(embedding)
             msg = models.Message(
                 workspace_name=ctx.workspace_name,
@@ -581,8 +815,12 @@ class TestSearchMessages:
 
         result = await _handle_search_messages(ctx, {"query": "test message"})
 
-        # Should return some result (may be empty if semantic search doesn't match)
-        assert isinstance(result, str)
+        # handler may return ToolResult (with search metadata) or
+        # a plain str. Both carry the result text; just check it's
+        # introspectable as string content.
+        from src.utils.types import ToolResult
+
+        assert isinstance(result, str | ToolResult)
 
 
 @pytest.mark.asyncio
@@ -610,6 +848,78 @@ class TestGrepMessages:
         result = await _handle_grep_messages(ctx, {"text": ""})
 
         assert "ERROR" in result
+
+
+@pytest.mark.asyncio
+class TestSearchMessagesTemporal:
+    """Tests for _handle_search_messages_temporal."""
+
+    async def test_reuses_precomputed_embedding(
+        self,
+        make_tool_context: Callable[..., ToolContext],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """Embeds once and forwards the precomputed embedding to CRUD search."""
+        ctx = make_tool_context()
+
+        embed_calls: list[str] = []
+        forwarded_embeddings: list[list[float] | None] = []
+
+        async def fake_embed(query: str) -> list[float]:
+            embed_calls.append(query)
+            return [0.9, 0.1, 0.3]
+
+        async def fake_search_messages_temporal(
+            workspace_name: str,
+            session_name: str | None,
+            query: str,
+            after_date: datetime | None = None,
+            before_date: datetime | None = None,
+            limit: int = 10,
+            context_window: int = 2,
+            embedding: list[float] | None = None,
+            observer: str | None = None,
+        ) -> list[tuple[list[models.Message], list[models.Message]]]:
+            _ = (
+                workspace_name,
+                session_name,
+                query,
+                after_date,
+                before_date,
+                limit,
+                context_window,
+                observer,
+            )
+            forwarded_embeddings.append(embedding)
+            msg = models.Message(
+                workspace_name=ctx.workspace_name,
+                session_name=ctx.session_name,
+                peer_name=ctx.observed,
+                content="Relevant temporal fallback message",
+                seq_in_session=1,
+                token_count=5,
+                created_at=datetime.now(timezone.utc),
+            )
+            return [([msg], [msg])]
+
+        monkeypatch.setattr("src.utils.agent_tools.embedding_client.embed", fake_embed)
+        monkeypatch.setattr(
+            "src.utils.agent_tools.crud.search_messages_temporal",
+            fake_search_messages_temporal,
+        )
+
+        result = await _handle_search_messages_temporal(
+            ctx,
+            {
+                "query": "when did this happen",
+                "after_date": "2024-01-01",
+                "before_date": "2024-12-31",
+            },
+        )
+
+        assert "Found" in result
+        assert embed_calls == ["when did this happen"]
+        assert forwarded_embeddings == [[0.9, 0.1, 0.3]]
 
 
 @pytest.mark.asyncio
@@ -651,18 +961,16 @@ class TestGetRecentHistory:
         result = await _handle_get_recent_history(ctx, {})
 
         assert "Conversation history" in result
-        assert "messages" in result.lower()
+        assert "messages" in str(result).lower()
 
     async def test_without_session_uses_observed(
         self,
-        db_session: AsyncSession,
         tool_test_data: Any,
     ):
         """Without session, retrieves messages from observed peer."""
         workspace, peer1, peer2, _, _, _ = tool_test_data
 
         ctx = ToolContext(
-            db=db_session,
             workspace_name=workspace.name,
             observer=peer1.name,
             observed=peer2.name,
@@ -774,11 +1082,20 @@ class TestUpdatePeerCard:
         ctx = make_tool_context()
 
         result = await _handle_update_peer_card(
-            ctx, {"content": ["Name: John", "Location: NYC", "Occupation: Engineer"]}
+            ctx,
+            {
+                "content": [
+                    "IDENTITY: Name: John",
+                    "ATTRIBUTE: Location: NYC",
+                    "ATTRIBUTE: Occupation: Engineer",
+                ]
+            },
         )
 
         assert "Updated peer card" in result
 
+        # Refresh the observer so the identity map picks up the committed update
+        await db_session.refresh(peer1)
         # Verify DB state
         peer_card = await crud.get_peer_card(
             db_session,
@@ -787,7 +1104,7 @@ class TestUpdatePeerCard:
             observed=peer2.name,
         )
         assert peer_card is not None
-        assert "Name: John" in peer_card
+        assert "IDENTITY: Name: John" in peer_card
 
     async def test_deduplicates_and_caps_peer_card(
         self,
@@ -799,11 +1116,20 @@ class TestUpdatePeerCard:
         workspace, peer1, peer2, _, _, _ = tool_test_data
         ctx = make_tool_context()
 
-        oversized = ["Name: John", "  Name:  John  ", "", "   "]
-        oversized.extend([f"Fact {i}" for i in range(MAX_PEER_CARD_FACTS + 5)])
+        oversized = [
+            "IDENTITY: Name: John",
+            "  IDENTITY: Name: John  ",
+            "",
+            "   ",
+        ]
+        oversized.extend(
+            [f"IDENTITY: Aliases: alias-{i}" for i in range(MAX_PEER_CARD_FACTS + 5)]
+        )
 
         await _handle_update_peer_card(ctx, {"content": oversized})
 
+        # Refresh the observer so the identity map picks up the committed update
+        await db_session.refresh(peer1)
         peer_card = await crud.get_peer_card(
             db_session,
             workspace_name=workspace.name,
@@ -813,7 +1139,7 @@ class TestUpdatePeerCard:
         assert peer_card is not None
         assert len(peer_card) == MAX_PEER_CARD_FACTS
         assert all(line.strip() for line in peer_card)
-        assert peer_card.count("Name: John") == 1
+        assert peer_card.count("IDENTITY: Name: John") == 1
 
     async def test_none_content_preserves_existing_card(
         self,
@@ -827,13 +1153,16 @@ class TestUpdatePeerCard:
 
         # First, create a valid peer card
         await _handle_update_peer_card(
-            ctx, {"content": ["Name: Alice", "Location: NYC"]}
+            ctx,
+            {"content": ["IDENTITY: Name: Alice", "ATTRIBUTE: Location: NYC"]},
         )
 
         # Now attempt to update with None — should be a no-op
         result = await _handle_update_peer_card(ctx, {"content": None})
-        assert "empty" in result.lower()
+        assert "empty" in str(result).lower()
 
+        # Refresh the observer so the identity map picks up the committed update
+        await db_session.refresh(peer1)
         # Verify original card is preserved
         peer_card = await crud.get_peer_card(
             db_session,
@@ -842,7 +1171,7 @@ class TestUpdatePeerCard:
             observed=peer2.name,
         )
         assert peer_card is not None
-        assert "Name: Alice" in peer_card
+        assert "IDENTITY: Name: Alice" in peer_card
 
     async def test_empty_list_preserves_existing_card(
         self,
@@ -855,12 +1184,17 @@ class TestUpdatePeerCard:
         ctx = make_tool_context()
 
         # First, create a valid peer card
-        await _handle_update_peer_card(ctx, {"content": ["Name: Bob", "Age: 30"]})
+        await _handle_update_peer_card(
+            ctx,
+            {"content": ["IDENTITY: Name: Bob", "ATTRIBUTE: Age: 30"]},
+        )
 
         # Now attempt to update with empty list — should be a no-op
         result = await _handle_update_peer_card(ctx, {"content": []})
-        assert "empty" in result.lower()
+        assert "empty" in str(result).lower()
 
+        # Refresh the observer so the identity map picks up the committed update
+        await db_session.refresh(peer1)
         # Verify original card is preserved
         peer_card = await crud.get_peer_card(
             db_session,
@@ -869,7 +1203,151 @@ class TestUpdatePeerCard:
             observed=peer2.name,
         )
         assert peer_card is not None
-        assert "Name: Bob" in peer_card
+        assert "IDENTITY: Name: Bob" in peer_card
+
+    async def test_rejects_entries_without_allowed_prefix(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """Entries without an allowed prefix are dropped; valid entries pass through."""
+        from src.utils.types import ToolResult
+
+        workspace, peer1, peer2, _, _, _ = tool_test_data
+        ctx = make_tool_context()
+
+        result = await _handle_update_peer_card(
+            ctx,
+            {
+                "content": [
+                    "IDENTITY: Name: Carol",
+                    "Age: 39+",  # rejected: no prefix
+                    "Daughter: Keyan",  # rejected: no prefix
+                    "TRAIT: Methodical",  # rejected: TRAIT not allowed
+                    "PREFERENCE: Tea",  # rejected: bare PREFERENCE not allowed
+                    "ATTRIBUTE: Location: Germantown, TN",
+                ]
+            },
+        )
+
+        # Partial-reject success path must surface the rejection in the tool
+        # response so the model can re-emit the dropped entries (with correct
+        # prefixes) on a retry instead of silently losing them.
+        assert isinstance(result, ToolResult)
+        content_lower = str(result).lower()
+        assert "updated peer card" in content_lower
+        assert "rejected 4 of 6" in content_lower
+        # At least one rejected sample should appear so the model knows what
+        # to fix.
+        assert "age: 39+" in content_lower or "trait: methodical" in content_lower
+        assert result.metadata is not None
+        assert result.metadata["peer_card_updated"] is True
+        assert result.metadata["facts_count"] == 2
+        assert result.metadata["rejected_count"] == 4
+
+        await db_session.refresh(peer1)
+        peer_card = await crud.get_peer_card(
+            db_session,
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+        )
+        assert peer_card is not None
+        assert peer_card == [
+            "IDENTITY: Name: Carol",
+            "ATTRIBUTE: Location: Germantown, TN",
+        ]
+
+    async def test_all_entries_rejected_preserves_existing_card(
+        self,
+        db_session: AsyncSession,
+        tool_test_data: Any,
+        make_tool_context: Callable[..., ToolContext],
+    ):
+        """When every entry fails validation, the existing card is preserved."""
+        workspace, peer1, peer2, _, _, _ = tool_test_data
+        ctx = make_tool_context()
+
+        await _handle_update_peer_card(ctx, {"content": ["IDENTITY: Name: Dana"]})
+
+        result = await _handle_update_peer_card(
+            ctx,
+            {
+                "content": [
+                    "TRAIT: Detail-oriented",
+                    "PREFERENCE: Coffee",
+                    "Random unprefixed line",
+                ]
+            },
+        )
+        assert "rejected" in str(result).lower()
+
+        await db_session.refresh(peer1)
+        peer_card = await crud.get_peer_card(
+            db_session,
+            workspace_name=workspace.name,
+            observer=peer1.name,
+            observed=peer2.name,
+        )
+        assert peer_card == ["IDENTITY: Name: Dana"]
+
+
+class TestPeerCardEntryValidator:
+    """Unit tests for the pure structural validator."""
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "IDENTITY: Name: Alice",
+            "ATTRIBUTE: Location: NYC",
+            "ATTRIBUTE: Prefers tea",
+            "RELATIONSHIP: Spouse: Bob",
+            "RELATIONSHIP: Maintainer: vineeth",
+            "INSTRUCTION: Call me Vee",
+            "INSTRUCTION: Never push to main without review",
+        ],
+    )
+    def test_accepts_well_formed_entries(self, entry: str):
+        assert _validate_peer_card_entry(entry) is True
+
+    @pytest.mark.parametrize(
+        "entry",
+        [
+            "",
+            "   ",
+            "Name: Alice",  # missing prefix
+            "Age: 39+",  # missing prefix
+            "Daughter: Keyan",  # missing prefix
+            "TRAIT: Methodical",  # disallowed kind
+            "PREFERENCE: Tea",  # disallowed kind
+            "identity: name: alice",  # wrong case
+            "IDENTITY:Name: Alice",  # missing space after colon
+            "IDENTITY: ",  # empty body
+            "IDENTITY:    ",  # whitespace-only body
+        ],
+    )
+    def test_rejects_malformed_entries(self, entry: str):
+        assert _validate_peer_card_entry(entry) is False
+
+    def test_rejects_over_length_cap(self):
+        long_value = "x" * (MAX_PEER_CARD_ENTRY_LENGTH + 1)
+        assert _validate_peer_card_entry(f"IDENTITY: Name: {long_value}") is False
+
+    def test_accepts_at_length_cap(self):
+        # Build an entry exactly at the cap.
+        prefix = "IDENTITY: "
+        body = "x" * (MAX_PEER_CARD_ENTRY_LENGTH - len(prefix))
+        assert _validate_peer_card_entry(prefix + body) is True
+
+    def test_allowed_prefixes_constant_is_complete(self):
+        # Guard against silent drift between the prompt and the validator.
+        assert PEER_CARD_ALLOWED_PREFIXES == (
+            "IDENTITY:",
+            "ATTRIBUTE:",
+            "RELATIONSHIP:",
+            "INSTRUCTION:",
+        )
 
 
 @pytest.mark.asyncio
@@ -915,7 +1393,6 @@ class TestGetPeerCard:
         await db_session.flush()
 
         ctx = ToolContext(
-            db=db_session,
             workspace_name=workspace.name,
             observer=peer1.name,
             observed=peer2.name,
@@ -970,7 +1447,6 @@ class TestExtractPreferences:
 
     async def test_falls_back_to_per_query_embedding_when_batch_fails(
         self,
-        db_session: AsyncSession,
         tool_test_data: Any,
         monkeypatch: pytest.MonkeyPatch,
     ):
@@ -989,15 +1465,15 @@ class TestExtractPreferences:
         embedding_args: list[list[float] | None] = []
 
         async def fake_search_messages(
-            _db: AsyncSession,
             workspace_name: str,
             session_name: str | None,
             query: str,
             limit: int,
             context_window: int,
             embedding: list[float] | None,
+            observer: str | None = None,
         ) -> list[tuple[list[models.Message], list[models.Message]]]:
-            _ = (limit, context_window)
+            _ = (limit, context_window, observer)
             embedding_args.append(embedding)
             msg = models.Message(
                 workspace_name=workspace_name,
@@ -1023,7 +1499,6 @@ class TestExtractPreferences:
         )
 
         result = await extract_preferences(
-            db_session,
             workspace_name=workspace.name,
             session_name=session.name,
             observed=observed_peer.name,
@@ -1062,14 +1537,11 @@ class TestFinishConsolidation:
 class TestToolExecutor:
     """Tests for create_tool_executor and the executor function."""
 
-    async def test_create_tool_executor_returns_callable(
-        self, db_session: AsyncSession, tool_test_data: Any
-    ):
+    async def test_create_tool_executor_returns_callable(self, tool_test_data: Any):
         """create_tool_executor returns an async callable."""
         workspace, peer1, peer2, session, _, _ = tool_test_data
 
         executor = await create_tool_executor(
-            db=db_session,
             workspace_name=workspace.name,
             observer=peer1.name,
             observed=peer2.name,
@@ -1078,14 +1550,11 @@ class TestToolExecutor:
 
         assert callable(executor)
 
-    async def test_executor_routes_to_correct_handler(
-        self, db_session: AsyncSession, tool_test_data: Any
-    ):
+    async def test_executor_routes_to_correct_handler(self, tool_test_data: Any):
         """Executor routes tool calls to correct handlers."""
         workspace, peer1, peer2, session, _, _ = tool_test_data
 
         executor = await create_tool_executor(
-            db=db_session,
             workspace_name=workspace.name,
             observer=peer1.name,
             observed=peer2.name,
@@ -1098,14 +1567,11 @@ class TestToolExecutor:
         # Should be from get_peer_card handler
         assert "peer card" in result.lower() or "No peer card" in result
 
-    async def test_executor_unknown_tool_returns_error(
-        self, db_session: AsyncSession, tool_test_data: Any
-    ):
+    async def test_executor_unknown_tool_returns_error(self, tool_test_data: Any):
         """Unknown tool name returns error message."""
         workspace, peer1, peer2, session, _, _ = tool_test_data
 
         executor = await create_tool_executor(
-            db=db_session,
             workspace_name=workspace.name,
             observer=peer1.name,
             observed=peer2.name,
@@ -1116,14 +1582,11 @@ class TestToolExecutor:
 
         assert "Unknown tool" in result
 
-    async def test_executor_handles_exceptions_gracefully(
-        self, db_session: AsyncSession, tool_test_data: Any
-    ):
+    async def test_executor_handles_exceptions_gracefully(self, tool_test_data: Any):
         """Executor converts exceptions to error strings instead of raising."""
         workspace, peer1, peer2, session, _, _ = tool_test_data
 
         executor = await create_tool_executor(
-            db=db_session,
             workspace_name=workspace.name,
             observer=peer1.name,
             observed=peer2.name,
@@ -1137,13 +1600,12 @@ class TestToolExecutor:
         # Should contain error info, not raise exception
 
     async def test_executor_dreamer_context_includes_observation_ids(
-        self, db_session: AsyncSession, tool_test_data: Any
+        self, tool_test_data: Any
     ):
         """Dreamer context (include_observation_ids=True) shows IDs in output."""
         workspace, peer1, peer2, session, _, _ = tool_test_data
 
         executor = await create_tool_executor(
-            db=db_session,
             workspace_name=workspace.name,
             observer=peer1.name,
             observed=peer2.name,
@@ -1160,3 +1622,199 @@ class TestToolExecutor:
         if "Found" in result and "observations" in result:
             # IDs should be included in the output
             assert "[id:" in result or "observations" in result
+
+
+# =============================================================================
+# Observation Lock Registry Tests
+# =============================================================================
+
+
+@pytest.mark.asyncio
+class TestObservationLockRegistry:
+    """Tests for the WeakValueDictionary-based observation lock registry."""
+
+    async def test_same_key_returns_same_lock(self):
+        """Concurrent callers with the same key get the same Lock instance."""
+        from src.utils.agent_tools import get_observation_lock
+
+        lock_a = await get_observation_lock("ws1", "obs1", "peer1")
+        lock_b = await get_observation_lock("ws1", "obs1", "peer1")
+
+        assert lock_a is lock_b
+
+    async def test_different_keys_return_different_locks(self):
+        """Different keys produce independent Lock instances."""
+        from src.utils.agent_tools import get_observation_lock
+
+        lock_a = await get_observation_lock("ws_diff_a", "obs", "peer")
+        lock_b = await get_observation_lock("ws_diff_b", "obs", "peer")
+
+        assert lock_a is not lock_b
+
+    async def test_lock_evicted_after_all_references_dropped(self):
+        """Lock is removed from registry once no strong references remain."""
+        import gc
+
+        from src.utils.agent_tools import (
+            _observation_locks,  # pyright: ignore[reportPrivateUsage]
+            get_observation_lock,
+        )
+
+        key = ("ws_evict", "obs_evict", "peer_evict")
+        lock = await get_observation_lock(*key)
+        assert key in _observation_locks
+
+        # Drop the only strong reference and force GC
+        del lock
+        gc.collect()
+
+        assert key not in _observation_locks
+
+    async def test_lock_recreated_after_eviction(self):
+        """A new lock is created for a key whose previous lock was evicted."""
+        import gc
+        import weakref
+
+        from src.utils.agent_tools import get_observation_lock
+
+        key = ("ws_recreate", "obs_recreate", "peer_recreate")
+        first_lock = await get_observation_lock(*key)
+        first_ref = weakref.ref(first_lock)
+
+        # Evict
+        del first_lock
+        gc.collect()
+
+        # Confirm the old lock was garbage-collected
+        assert first_ref() is None
+
+        # Recreate
+        second_lock = await get_observation_lock(*key)
+        assert isinstance(second_lock, asyncio.Lock)
+
+    async def test_lock_survives_while_any_reference_held(self):
+        """Lock stays alive as long as at least one strong reference exists."""
+        import gc
+
+        from src.utils.agent_tools import (
+            _observation_locks,  # pyright: ignore[reportPrivateUsage]
+            get_observation_lock,
+        )
+
+        key = ("ws_survive", "obs_survive", "peer_survive")
+        ref_a = await get_observation_lock(*key)
+        ref_b = await get_observation_lock(*key)
+        assert ref_a is ref_b
+
+        # Drop one reference — lock should survive via the other
+        del ref_a
+        gc.collect()
+        assert key in _observation_locks
+
+        # Drop the last reference — now it should be evicted
+        del ref_b
+        gc.collect()
+        assert key not in _observation_locks
+
+    async def test_concurrent_executors_share_lock_for_mutual_exclusion(self):
+        """Two coroutines using the same key are serialized by the shared lock."""
+        from src.utils.agent_tools import get_observation_lock
+
+        key = ("ws_mutex", "obs_mutex", "peer_mutex")
+        shared_lock = await get_observation_lock(*key)
+
+        order: list[str] = []
+
+        async def task(name: str, delay: float):
+            async with shared_lock:
+                order.append(f"{name}_start")
+                await asyncio.sleep(delay)
+                order.append(f"{name}_end")
+
+        # task_a grabs the lock first, task_b must wait
+        task_a = asyncio.create_task(task("a", 0.05))
+        await asyncio.sleep(0.01)  # let task_a acquire the lock
+        task_b = asyncio.create_task(task("b", 0.01))
+
+        await asyncio.gather(task_a, task_b)
+
+        # task_a must fully complete before task_b starts
+        assert order == ["a_start", "a_end", "b_start", "b_end"]
+
+    async def test_no_registry_growth_across_many_keys(self):
+        """Registry does not retain locks after references are dropped."""
+        import gc
+
+        from src.utils.agent_tools import (
+            _observation_locks,  # pyright: ignore[reportPrivateUsage]
+            get_observation_lock,
+        )
+
+        locks: list[asyncio.Lock] = []
+        for i in range(100):
+            locks.append(await get_observation_lock(f"ws_growth_{i}", "obs", "peer"))
+
+        count_before = sum(
+            1 for k in _observation_locks if k[0].startswith("ws_growth_")
+        )
+        assert count_before == 100
+
+        # Drop all strong references and force GC
+        locks.clear()
+        gc.collect()
+
+        # All 100 entries should be cleaned up
+        remaining = sum(1 for k in _observation_locks if k[0].startswith("ws_growth_"))
+        assert remaining == 0
+
+
+@pytest.mark.asyncio
+class TestObserverPeerNameWiring:
+    """Tests that tool handlers pass observer to CRUD functions."""
+
+    async def test_grep_messages_passes_observer(
+        self,
+        make_tool_context: Callable[..., ToolContext],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """_handle_grep_messages passes ctx.observer as observer."""
+        ctx = make_tool_context()
+        captured_kwargs: dict[str, Any] = {}
+
+        async def fake_grep_messages(
+            **kwargs: Any,
+        ) -> list[tuple[list[models.Message], list[models.Message]]]:
+            captured_kwargs.update(kwargs)
+            return []
+
+        monkeypatch.setattr(
+            "src.utils.agent_tools.crud.grep_messages", fake_grep_messages
+        )
+
+        await _handle_grep_messages(ctx, {"text": "hello"})
+
+        assert captured_kwargs["observer"] == ctx.observer
+
+    async def test_get_messages_by_date_range_passes_observer(
+        self,
+        make_tool_context: Callable[..., ToolContext],
+        monkeypatch: pytest.MonkeyPatch,
+    ):
+        """_handle_get_messages_by_date_range passes ctx.observer as observer."""
+        ctx = make_tool_context()
+        captured_kwargs: dict[str, Any] = {}
+
+        async def fake_get_messages_by_date_range(
+            _db: Any, **kwargs: Any
+        ) -> list[models.Message]:
+            captured_kwargs.update(kwargs)
+            return []
+
+        monkeypatch.setattr(
+            "src.utils.agent_tools.crud.get_messages_by_date_range",
+            fake_get_messages_by_date_range,
+        )
+
+        await _handle_get_messages_by_date_range(ctx, {"after_date": "2024-01-01"})
+
+        assert captured_kwargs["observer"] == ctx.observer

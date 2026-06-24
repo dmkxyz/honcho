@@ -1,3 +1,5 @@
+"""CRUD helpers for workspace records and workspace deletion checks."""
+
 from dataclasses import dataclass
 from logging import getLogger
 from typing import Any
@@ -154,17 +156,25 @@ async def get_or_create_workspace(
 
 async def get_all_workspaces(
     filters: dict[str, Any] | None = None,
+    reverse: bool = False,
 ) -> Select[tuple[models.Workspace]]:
     """
     Get all workspaces.
 
     Args:
-        db: Database session
         filters: Filter the workspaces by a dictionary of metadata
+        reverse: Whether to reverse the default creation order
     """
     stmt = select(models.Workspace)
     stmt = apply_filter(stmt, models.Workspace, filters)
-    stmt: Select[tuple[models.Workspace]] = stmt.order_by(models.Workspace.created_at)
+    if reverse:
+        stmt = stmt.order_by(
+            models.Workspace.created_at.desc(), models.Workspace.id.desc()
+        )
+    else:
+        stmt = stmt.order_by(
+            models.Workspace.created_at.asc(), models.Workspace.id.asc()
+        )
     return stmt
 
 
@@ -202,7 +212,11 @@ async def update_workspace(
     db: AsyncSession, workspace_name: str, workspace: schemas.WorkspaceUpdate
 ) -> models.Workspace:
     """
-    Update a workspace.
+    Get or create a workspace, then apply metadata and configuration updates.
+
+    Provided metadata replaces the current metadata when present. Provided
+    configuration keys are merged into the existing configuration instead of
+    replacing it wholesale.
 
     Args:
         db: Database session
@@ -211,6 +225,10 @@ async def update_workspace(
 
     Returns:
         The updated workspace
+
+    Raises:
+        ConflictException: If concurrent creation prevents fetching or creating
+            the workspace
     """
     ws_result = await get_or_create_workspace(
         db,
@@ -250,7 +268,6 @@ async def update_workspace(
         return honcho_workspace
 
     await db.commit()
-    await db.refresh(honcho_workspace)
     await ws_result.post_commit()
 
     # Only invalidate if we actually updated

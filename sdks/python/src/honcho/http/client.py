@@ -131,17 +131,15 @@ class HonchoHTTPClient:
 
                 raise error
 
-            except httpx.TimeoutException as e:
-                error = TimeoutError(f"Request timed out after {request_timeout}s")
-                if attempt < self.max_retries:
-                    last_error = error
-                    time.sleep(self._get_retry_delay(attempt))
-                    attempt += 1
-                    continue
-                raise error from e
-
-            except httpx.ConnectError as e:
-                error = ConnectionError(f"Connection failed: {e}")
+            except (
+                httpx.TimeoutException,
+                httpx.NetworkError,
+                httpx.RemoteProtocolError,
+            ) as e:
+                if isinstance(e, httpx.TimeoutException):
+                    error = TimeoutError(f"Request timed out after {request_timeout}s")
+                else:
+                    error = ConnectionError(f"Connection error: {e}")
                 if attempt < self.max_retries:
                     last_error = error
                     time.sleep(self._get_retry_delay(attempt))
@@ -369,7 +367,7 @@ class HonchoHTTPClient:
             from datetime import datetime
             from email.utils import parsedate_to_datetime
 
-            dt: datetime = cast(datetime, parsedate_to_datetime(header))
+            dt: datetime = parsedate_to_datetime(header)
             timestamp: float = dt.timestamp()
             return max(0.0, timestamp - time.time())
         except Exception:

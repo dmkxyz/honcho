@@ -1,14 +1,15 @@
+"""FastAPI routes for workspace resources and workspace-scoped operations."""
+
 import logging
 
 from fastapi import APIRouter, Body, Depends, HTTPException, Path, Query, Response
 from fastapi_pagination import Page
 from fastapi_pagination.ext.sqlalchemy import apaginate
-from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from src import crud, models, schemas
+from src import crud, schemas
 from src.config import settings
-from src.dependencies import db
+from src.dependencies import db, read_db
 from src.deriver.enqueue import enqueue_deletion, enqueue_dream
 from src.exceptions import AuthenticationException
 from src.security import JWTParams, require_auth
@@ -65,7 +66,8 @@ async def get_all_workspaces(
     options: schemas.WorkspaceGet | None = Body(
         None, description="Filtering and pagination options for the workspaces list"
     ),
-    db: AsyncSession = db,
+    reverse: bool = Query(False, description="Whether to reverse the order of results"),
+    db: AsyncSession = read_db,
 ):
     """Get all Workspaces, paginated with optional filters."""
     filter_param = None
@@ -76,7 +78,7 @@ async def get_all_workspaces(
 
     return await apaginate(
         db,
-        await crud.get_all_workspaces(filters=filter_param),
+        await crud.get_all_workspaces(filters=filter_param, reverse=reverse),
     )
 
 
@@ -142,7 +144,6 @@ async def search_workspace(
     body: schemas.MessageSearchOptions = Body(
         ..., description="Message search parameters"
     ),
-    db: AsyncSession = db,
 ):
     """
     Search messages in a Workspace using optional filters. Use `limit` to control the number of
@@ -151,7 +152,7 @@ async def search_workspace(
     # take user-provided filter and add workspace_id to it
     filters = body.filters or {}
     filters["workspace_id"] = workspace_id
-    return await search(db, body.query, filters=filters, limit=body.limit)
+    return await search(body.query, filters=filters, limit=body.limit)
 
 
 @router.get(
@@ -168,7 +169,7 @@ async def get_queue_status(
     session_id: str | None = Query(
         None, description="Optional session ID to filter by"
     ),
-    db: AsyncSession = db,
+    db: AsyncSession = read_db,
 ):
     """
     Get the processing queue status for a Workspace, optionally scoped to an observer, sender,
@@ -202,7 +203,6 @@ async def schedule_dream(
     request: schemas.ScheduleDreamRequest = Body(
         ..., description="Dream scheduling parameters"
     ),
-    db: AsyncSession = db,
 ):
     """
     Manually schedule a dream task for a specific collection.
@@ -225,22 +225,19 @@ async def schedule_dream(
     observed = request.observed if request.observed is not None else request.observer
     dream_type = request.dream_type
 
-    # Count documents in the collection
-    count_stmt = select(func.count(models.Document.id)).where(
-        models.Document.workspace_name == workspace_id,
-        models.Document.observer == observer,
-        models.Document.observed == observed,
-    )
-    document_count = int(await db.scalar(count_stmt) or 0)
-
-    # Enqueue the dream task for immediate processing
     await enqueue_dream(
         workspace_id,
         observer=observer,
         observed=observed,
         dream_type=dream_type,
-        document_count=document_count,
         session_name=request.session_id,
+        # Manual route — explicit sentinels for the DreamRunEvent
+        # scheduling-context fields. Auto-schedule threads concrete
+        # threshold/delay reasons (see src/dreamer/dream_scheduler.py);
+        # without these, manual dreams arrive with both null and break
+        # analytics joins on `trigger_reason`.
+        trigger_reason="manual",
+        delay_reason="immediate",
     )
 
     logger.info(

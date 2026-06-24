@@ -5,6 +5,58 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](http://keepachangelog.com/)
 and this project adheres to [Semantic Versioning](http://semver.org/).
 
+## [2.1.2] - 2026-05-21
+
+### Added
+
+- `peers` option on `Honcho.session()` — attach peers to a session at creation time instead of needing a follow-up `session.addPeers()` call. Accepts the same `PeerAddition` shape as `session.addPeers()` (peer ID strings, `Peer` objects, arrays of either, or a record with per-peer `observe_me`/`observe_others` config).
+
+### Changed
+
+- ID validation in `validation.ts` now accepts workspace, peer, and session IDs up to 512 characters (was 100), matching the server-side schema change in Honcho v3.0.7.
+
+### Fixed
+
+- `Honcho.workspaces()` now actually forwards the `reverse` option to the server. The 2.1.0 changelog listed `workspaces()` among the list methods that gained `reverse`, but `client.ts` was missing the field on the params type and request builder, so the option was silently dropped. Honoring `reverse` on the workspace/peer/session list routes also requires a Honcho server with the matching API fix; older servers silently ignore the parameter.
+
+## [2.1.1] - 2026-04-01
+
+### Fixed
+
+- Broadened fetch error retry logic to catch all `TypeError` network failures (connection resets, DNS errors, etc.) instead of only those with `'fetch'` in the message, improving resilience across runtimes (Node, Bun, browsers)
+
+## [2.1.0] - 2026-03-25
+
+### Added
+
+- `createdAt` property on `Peer` and `Session` wrapper objects
+- `isActive` property on `Session` wrapper objects
+- `getMessage(messageId)` method on `Session` to fetch a single message by ID
+- `Peer.representation()`, `Session.representation()`, and `Session.context()` now accept `Message` objects for `searchQuery` (extracts `.content` automatically)
+- `page`, `size`, and `reverse` pagination controls on all list methods: `peers()`, `sessions()`, `messages()`, `workspaces()`, and `conclusions.list()`
+
+### Changed
+
+- **Breaking**: `searchQuery` removed from top-level `context()` options. Use `representationOptions.searchQuery` instead — this eliminates the duplicate parameter and is consistent with the API structure.
+- List methods (`peers()`, `sessions()`, `messages()`, `workspaces()`) support both the new options object and the legacy raw-filter form: `peers({ filters, page, size, reverse })` and `peers(filters)`.
+- Representation search options now accept strings and content-like objects (including `Message` instances) while rejecting whitespace-only or invalid runtime inputs.
+- **Breaking**: `peer()` and `session()` now always make a get-or-create API call. Previously, calling without metadata/configuration returned a lazy object with no API call. All Peer/Session objects now have `createdAt` populated immediately.
+- Response configuration models (`WorkspaceConfigurationResponse`, `SessionConfigurationResponse`) now tolerate unknown fields from newer servers for forward compatibility
+- Reusable `PeerIdObjectSchema` and `SessionIdObjectSchema` helpers for union validation
+- Moved `@types/node` from `dependencies` to `devDependencies`
+
+### Fixed
+
+- `uploadFile()` now rejects unsupported top-level binary/object inputs and only validates inputs the serializer can actually upload.
+- `uploadFile()` now serializes message configuration using API field names, matching `addMessages()`.
+- Session fetch methods now refresh cached `createdAt` and `isActive` values alongside metadata and configuration.
+
+## [2.0.2] - 2026-03-10
+
+### Changed
+
+- **Breaking**: Client constructor now rejects unknown options via `.strict()` Zod validation. Previously, misspelled options (e.g., `baseUrl` instead of `baseURL`) were silently ignored, causing the SDK to fall back to defaults. Now a `ZodError` is thrown with the unrecognized key name.
+
 ## [2.0.1] - 2026-02-09
 
 ### Added

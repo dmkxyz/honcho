@@ -8,7 +8,7 @@ Before you start contributing, please:
 
 1. **Set up your development environment** - Follow the [Local Development guide](./README.md#local-development) in the README to get Honcho running locally.
 
-2. **Join our community** - Feel free to join us in our [Discord](http://discord.gg/plasticlabs) to discuss your changes, get help, or ask questions.
+2. **Join our community** - Feel free to join us in our [Discord](http://discord.gg/honcho) to discuss your changes, get help, or ask questions.
 
 3. **Review existing issues** - Check the [issues tab](https://github.com/plastic-labs/honcho/issues) to see what's already being worked on or to find something to contribute to.
 
@@ -101,12 +101,51 @@ git commit -m "docs(readme): update installation instructions"
    - Any relevant issue numbers (use "Closes #123" to auto-close issues)
    - Screenshots or examples if applicable
 
+## Pre-commit Hooks
+
+Honcho uses pre-commit hooks to enforce code quality and consistency. They run linting, formatting, type checking, and security scans before each commit.
+
+### Installation
+
+```bash
+uv add --dev pre-commit
+uv run pre-commit install \
+    --hook-type pre-commit \
+    --hook-type commit-msg \
+    --hook-type pre-push
+```
+
+### What the hooks do
+
+- **Code Quality** — Python linting and formatting (ruff), TypeScript linting (biome)
+- **Type Checking** — Static analysis with basedpyright
+- **Security** — Vulnerability scanning with bandit
+- **Documentation** — Markdown linting and license header checks
+- **Testing** — Automated test runs for Python and TypeScript
+- **File Hygiene** — Trailing whitespace, line endings, file size checks
+- **Commit Standards** — Conventional commit message validation
+
+### Manual execution
+
+Run against all files without committing:
+
+```bash
+uv run pre-commit run --all-files
+```
+
+Run a specific hook:
+
+```bash
+uv run pre-commit run ruff --all-files
+uv run pre-commit run basedpyright --all-files
+```
+
 ## Coding Standards
 
 ### Python Code Style
 
 - Follow [PEP 8](https://www.python.org/dev/peps/pep-0008/) style guidelines
-- Use [Black](https://black.readthedocs.io/) for code formatting (we may add this to CI in the future)
+- Use [ruff](https://docs.astral.sh/ruff/) for linting and code formatting
 - Use type hints where possible
 - Write docstrings for functions and classes using Google style docstrings
 
@@ -164,7 +203,7 @@ When reporting bugs or requesting features:
 
 ## Questions and Support
 
-- **General questions** - Join our [Discord](http://discord.gg/plasticlabs)
+- **General questions** - Join our [Discord](http://discord.gg/honcho)
 - **Bug reports** - Use GitHub issues
 - **Feature requests** - Use GitHub issues with the feature request template
 - **Security issues** - Please email us privately rather than opening a public issue

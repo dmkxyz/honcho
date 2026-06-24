@@ -1,3 +1,5 @@
+"""CRUD helpers for peer records and peer-scoped session queries."""
+
 from logging import getLogger
 from typing import Any
 
@@ -210,20 +212,28 @@ async def get_peer(
 
 async def get_peers(
     workspace_name: str,
-    filters: dict[str, str] | None = None,
+    filters: dict[str, Any] | None = None,
+    reverse: bool = False,
 ) -> Select[tuple[models.Peer]]:
+    """Build a filtered peer list query ordered by creation time."""
     stmt = select(models.Peer).where(models.Peer.workspace_name == workspace_name)
 
     stmt = apply_filter(stmt, models.Peer, filters)
 
-    return stmt.order_by(models.Peer.created_at)
+    if reverse:
+        return stmt.order_by(models.Peer.created_at.desc(), models.Peer.id.desc())
+    return stmt.order_by(models.Peer.created_at.asc(), models.Peer.id.asc())
 
 
 async def update_peer(
     db: AsyncSession, workspace_name: str, peer_name: str, peer: schemas.PeerUpdate
 ) -> models.Peer:
     """
-    Update a peer.
+    Get or create a peer, then apply metadata and configuration updates.
+
+    If the peer does not exist, the workspace and peer are created first.
+    Provided metadata and configuration replace the existing values when
+    present.
 
     Args:
         db: Database session
@@ -235,9 +245,8 @@ async def update_peer(
         The updated peer
 
     Raises:
-        ResourceNotFoundException: If the peer does not exist
-        ValidationException: If the update data is invalid
-        ConflictException: If the update violates a unique constraint
+        ConflictException: If concurrent creation prevents fetching or creating
+            the peer
     """
     peers_result = await get_or_create_peers(
         db, workspace_name, [schemas.PeerCreate(name=peer_name)]
@@ -269,7 +278,6 @@ async def update_peer(
         return honcho_peer
 
     await db.commit()
-    await db.refresh(honcho_peer)
     await peers_result.post_commit()
 
     cache_key = peer_cache_key(workspace_name, honcho_peer.name)
@@ -283,6 +291,7 @@ async def get_sessions_for_peer(
     workspace_name: str,
     peer_name: str,
     filters: dict[str, Any] | None = None,
+    reverse: bool = False,
 ) -> Select[tuple[models.Session]]:
     """
     Get all sessions for a peer through the session_peers relationship.
@@ -291,6 +300,7 @@ async def get_sessions_for_peer(
         workspace_name: Name of the workspace
         peer_name: Name of the peer
         filters: Filter sessions by metadata
+        reverse: Whether to reverse the default creation order
 
     Returns:
         SQLAlchemy Select statement
@@ -308,6 +318,9 @@ async def get_sessions_for_peer(
 
     stmt = apply_filter(stmt, models.Session, filters)
 
-    stmt: Select[tuple[models.Session]] = stmt.order_by(models.Session.created_at)
+    if reverse:
+        stmt = stmt.order_by(models.Session.created_at.desc(), models.Session.id.desc())
+    else:
+        stmt = stmt.order_by(models.Session.created_at.asc(), models.Session.id.asc())
 
     return stmt
